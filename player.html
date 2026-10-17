@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Cinema System Player</title>
+<!--
+  مشغّل الفيديو الذي يُعرض على الشاشة (DUI).
+  - الروابط المباشرة: تعمل من داخل المورد (nui://cinema_system/html/player.html).
+  - يوتيوب: يلزم رفع هذا الملف نفسه على استضافة https ووضع رابطه في Config.Video.YoutubePlayerPage
+    لأن يوتيوب يرفض التضمين بدون Referer (Error 153).
+  الأمان: لا نستخدم innerHTML أبداً، والنصوص تُعرض بـ textContent، ومعرّف يوتيوب يُتحقق منه (11 خانة).
+-->
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #03050a; color: #e6f6ff; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; }
+video, iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; display: none; }
+video { object-fit: contain; }
+#idle { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2vh;
+  background: radial-gradient(ellipse at 50% 40%, #0b1a33 0%, #05080f 70%); }
+.ring { width: 18vh; height: 18vh; border-radius: 50%; border: .5vh solid rgba(34,211,238,.4); box-shadow: 0 0 5vh rgba(34,211,238,.3); display: flex; align-items: center; justify-content: center; }
+.ring::after { content: ''; border-left: 5.6vh solid #22d3ee; border-top: 3.4vh solid transparent; border-bottom: 3.4vh solid transparent; transform: translateX(-.6vh) scaleX(-1); }
+.name { font-size: 6vh; letter-spacing: .5vh; background: linear-gradient(90deg, #22d3ee, #a78bfa, #f472b6); -webkit-background-clip: text; color: transparent; }
+#banner { position: absolute; bottom: 7%; right: 5%; max-width: 70%; padding: 1.4vh 3vh; border-radius: 1.4vh; font-size: 3.6vh;
+  background: rgba(5,10,20,.8); border: 1px solid rgba(34,211,238,.45); opacity: 0; transition: opacity .6s; pointer-events: none; z-index: 5; }
+#banner.show { opacity: 1; }
+#error { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; text-align: center; padding: 6vh;
+  font-size: 4.4vh; line-height: 1.6; background: rgba(60,6,14,.92); color: #ffd7dc; z-index: 6; }
+</style>
+</head>
+<body>
+<div id="idle"><div class="ring"></div><div class="name">CINEMA SYSTEM</div></div>
+<video id="v" playsinline></video>
+<iframe id="yt" allow="autoplay; encrypted-media" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+<div id="banner"></div>
+<div id="error"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js"></script>
+<script>
+(function () {
+  const idle = document.getElementById('idle');
+  const v = document.getElementById('v');
+  const yt = document.getElementById('yt');
+  const banner = document.getElementById('banner');
+  const errBox = document.getElementById('error');
+
+  let ctx = { resource: null, screen: null };
+  let cur = { rev: null, kind: null, src: '', status: 'idle' };
+  let target = null;           // آخر حالة مطلوبة { pos, at, status }
+  let hls = null;
+  let volume = 0, muted = false;
+  let bannerTimer = null;
+
+  // ---------- إبلاغ اللعبة (أفضل جهد؛ إن فشل فالرسالة تظهر على الشاشة نفسها) ----------
+  function report(event, message) {
+    if (!ctx.resource) return;
+    try {
+      fetch('https://' + ctx.resource + '/playerEvent', {
+        method: 'POST', mode: 'no-cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: event, message: message, screen: ctx.screen })
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
+  function fail(msg) {
+    errBox.textContent = msg;           // textContent فقط (آمن)
+    errBox.style.display = 'flex';
+    report('error', msg);
+  }
+  function clearError() { errBox.style.display = 'none'; errBox.textContent = ''; }
+
+  function show(which) {
+    idle.style.display = which === 'idle' ? 'flex' : 'none';
+    v.style.display = which === 'video' ? 'block' : 'none';
+    yt.style.display = which === 'yt' ? 'block' : 'none';
+  }
+
+  function ytCmd(func, args) {
+    try { yt.contentWindow.postMessage(JSON.stringify({ event: 'command', func: func, args: args || [] }), '*'); } catch (e) {}
+  }
+
+  function applyVolume() {
+    v.volume = Math.max(0, Math.min(1, volume / 100));
+    v.muted = muted;
+    if (cur.kind === 'youtube') {
+      ytCmd('setVolume', [volume]);
+      ytCmd(muted ? 'mute' : 'unMute');
+    }
+  }
+
+  function clearAll() {
+    try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) {}
+    if (hls) { hls.destroy(); hls = null; }
+    yt.src = 'about:blank';
+    cur = { rev: null, kind: null, src: '', status: 'idle' };
+    target = null;
+    clearError();
+    show('idle');
+  }
+
+  function showBanner(t) {
+    if (!t) return;
+    banner.textContent = t;
+    banner.classList.add('show');
+    clearTimeout(bannerTimer);
+    bannerTimer = setTimeout(function () { banner.classList.remove('show'); }, 6000);
+  }
+
+  function expected() {
+    if (!target) return 0;
+    let p = target.pos + (target.status === 'playing' ? (Date.now() - target.at) / 1000 : 0);
+    return Math.max(0, p);
+  }
+
+  function syncVideo(hard) {
+    if (!target || cur.kind === 'youtube') return;
+    const want = expected();
+    if (v.readyState >= 1) {
+      if (hard || Math.abs(v.currentTime - want) > 2.5) {
+        if (!isFinite(v.duration) || want < v.duration) v.currentTime = want;
+      }
+    }
+    if (target.status === 'playing') {
+      if (v.paused) {
+        const pr = v.play();
+        if (pr && pr.catch) pr.catch(function () { v.muted = true; v.play().catch(function () {}); });
+      }
+    } else if (!v.paused) {
+      v.pause();
+    }
+  }
+
+  function syncYoutube(hard) {
+    if (!target || cur.kind !== 'youtube') return;
+    ytCmd(target.status === 'playing' ? 'playVideo' : 'pauseVideo');
+    if (hard) ytCmd('seekTo', [expected(), true]);
+    applyVolume();
+  }
+
+  function load(m) {
+    clearError();
+    cur.kind = m.kind; cur.src = m.src;
+    if (hls) { hls.destroy(); hls = null; }
+
+    if (m.kind === 'youtube') {
+      if (!/^[\w-]{11}$/.test(String(m.src))) { fail('معرّف فيديو يوتيوب غير صالح.'); return; }
+      try { v.pause(); v.removeAttribute('src'); } catch (e) {}
+      yt.src = 'https://www.youtube-nocookie.com/embed/' + m.src +
+        '?autoplay=1&controls=0&disablekb=1&rel=0&modestbranding=1&playsinline=1&enablejsapi=1&start=' + Math.floor(m.position || 0);
+      show('yt');
+      yt.onload = function () {
+        try { yt.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 1, channel: 'widget' }), '*'); } catch (e) {}
+      };
+      setTimeout(function () { syncYoutube(false); }, 2500);
+      return;
+    }
+
+    if (!/^https?:\/\/[^\s]+$/.test(String(m.src))) { fail('رابط الفيديو غير صالح.'); return; }
+    yt.src = 'about:blank';
+    if (/\.m3u8(\?|$)/i.test(m.src)) {
+      if (window.Hls && Hls.isSupported()) {
+        hls = new Hls();
+        hls.on(Hls.Events.ERROR, function (e, data) { if (data && data.fatal) fail('تعذر تشغيل بث m3u8.'); });
+        hls.loadSource(m.src);
+        hls.attachMedia(v);
+      } else {
+        fail('تشغيل m3u8 يحتاج مكتبة hls.js (لم تُحمَّل من الإنترنت).');
+        return;
+      }
+    } else {
+      v.src = m.src;
+    }
+    show('video');
+    applyVolume();
+  }
+
+  const VIDEO_ERRORS = {
+    1: 'تم إلغاء التحميل.', 2: 'خطأ في الشبكة أو الرابط لا يستجيب.',
+    3: 'تعذر فك ترميز الفيديو.', 4: 'صيغة الفيديو غير مدعومة أو الرابط لا يشير إلى ملف فيديو.'
+  };
+  v.addEventListener('error', function () {
+    const code = v.error ? v.error.code : 0;
+    fail(VIDEO_ERRORS[code] || 'تعذر تشغيل الفيديو.');
+  });
+  v.addEventListener('loadedmetadata', function () { syncVideo(true); });
+  v.addEventListener('canplay', function () { syncVideo(false); });
+  v.addEventListener('playing', function () { clearError(); report('playing', ''); });
+
+  function onState(m) {
+    if (!m.src || m.status === 'idle') { if (cur.kind) clearAll(); return; }
+    const sameMedia = (cur.src === m.src && cur.kind === m.kind && m.kind !== 'youtube');
+    const revChanged = cur.rev !== m.rev;
+    target = { pos: m.position || 0, at: Date.now(), status: m.status };
+
+    if (revChanged && !sameMedia) {          // محتوى جديد
+      cur.rev = m.rev;
+      load(m);
+      showBanner(m.title);
+      cur.status = m.status;
+      return;
+    }
+    if (revChanged) {                        // تقديم/تأخير على نفس الفيديو
+      cur.rev = m.rev;
+      if (cur.kind === 'youtube') syncYoutube(true); else syncVideo(true);
+      cur.status = m.status;
+      return;
+    }
+    if (cur.kind === 'youtube') syncYoutube(cur.status !== m.status); else syncVideo(cur.status !== m.status);
+    cur.status = m.status;
+  }
+
+  window.addEventListener('message', function (e) {
+    let d = e.data;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (_) { return; } }
+    if (!d) return;
+
+    // أحداث مشغّل يوتيوب (تصل بعد رسالة listening)
+    if (d.event === 'onError') { fail('تعذر تشغيل فيديو يوتيوب (غير متاح للتضمين أو محذوف). رمز: ' + d.info); return; }
+    if (!d.type) return;
+
+    if (d.type === 'init') { ctx.resource = String(d.resource || '').replace(/[^\w-]/g, ''); ctx.screen = d.screen; }
+    else if (d.type === 'state') onState(d);
+    else if (d.type === 'volume') { volume = Number(d.volume) || 0; muted = d.muted === true; applyVolume(); }
+    else if (d.type === 'clear') clearAll();
+  });
+
+  show('idle');
+})();
+</script>
+</body>
+</html>
